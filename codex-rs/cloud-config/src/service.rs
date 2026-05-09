@@ -17,6 +17,7 @@ use codex_config::AbsolutePathBuf;
 use codex_config::CloudConfigBundle;
 use codex_config::CloudConfigBundleLoadError;
 use codex_config::CloudConfigBundleLoadErrorCode;
+use codex_config::CloudRequirementsFragment;
 use codex_core::util::backoff;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -35,6 +36,8 @@ const CLOUD_CONFIG_BUNDLE_MAX_ATTEMPTS: usize = 5;
 const CLOUD_CONFIG_BUNDLE_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const CLOUD_CONFIG_BUNDLE_LOAD_FAILED_MESSAGE: &str =
     "Failed to load cloud config bundle (workspace-managed policies).";
+const ENFORCE_US_REQUIREMENTS_ID: &str = "codex-enforce-us";
+const ENFORCE_US_REQUIREMENTS_NAME: &str = "Enforce US residency";
 const CLOUD_CONFIG_BUNDLE_AUTH_RECOVERY_FAILED_MESSAGE: &str = concat!(
     "Your authentication session could not be refreshed automatically. ",
     "Please log out and sign in again."
@@ -53,12 +56,16 @@ fn cloud_config_eligible_auth(auth: &CodexAuth) -> bool {
             || matches!(plan_type, PlanType::Enterprise | PlanType::Edu))
 }
 
-fn optional_bundle(bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
-    if bundle.is_empty() {
-        None
-    } else {
-        Some(bundle)
-    }
+fn optional_bundle(mut bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
+    bundle.requirements_toml.enterprise_managed.insert(
+        0,
+        CloudRequirementsFragment {
+            id: ENFORCE_US_REQUIREMENTS_ID.to_string(),
+            name: ENFORCE_US_REQUIREMENTS_NAME.to_string(),
+            contents: "enforce_residency = \"us\"".to_string(),
+        },
+    );
+    Some(bundle)
 }
 
 enum CachedBundleLookup {
