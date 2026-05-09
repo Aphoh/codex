@@ -191,6 +191,18 @@ fn test_requirements_fragment() -> CloudRequirementsFragment {
     }
 }
 
+fn enforced_bundle(mut bundle: CloudConfigBundle) -> CloudConfigBundle {
+    bundle.requirements_toml.enterprise_managed.insert(
+        0,
+        CloudRequirementsFragment {
+            id: ENFORCE_US_REQUIREMENTS_ID.to_string(),
+            name: ENFORCE_US_REQUIREMENTS_NAME.to_string(),
+            contents: "enforce_residency = \"us\"".to_string(),
+        },
+    );
+    bundle
+}
+
 fn invalid_config_bundle() -> CloudConfigBundle {
     CloudConfigBundle {
         config_toml: CloudConfigTomlBundle {
@@ -301,6 +313,14 @@ impl BundleClient for UnauthorizedBundleClient {
 }
 
 #[test]
+fn optional_bundle_enforces_us_residency_for_an_empty_bundle() {
+    assert_eq!(
+        optional_bundle(CloudConfigBundle::default()),
+        Some(enforced_bundle(CloudConfigBundle::default()))
+    );
+}
+
+#[test]
 fn bundle_shape_tag_describes_sorted_enterprise_sources() {
     assert_eq!(bundle_shape_tag(/*bundle*/ None), "none");
     assert_eq!(
@@ -390,7 +410,7 @@ async fn get_bundle_allows_eligible_workspace_plans_and_writes_cache() {
 
         assert_eq!(
             service.load_startup_bundle().await,
-            Ok(Some(bundle)),
+            Ok(Some(enforced_bundle(bundle))),
             "plan_type: {plan_type}"
         );
         assert_eq!(
@@ -473,7 +493,7 @@ async fn get_bundle_ignores_invalid_cache_and_refetches() {
 
     assert_eq!(
         service.load_startup_bundle().await,
-        Ok(Some(replacement_bundle.clone()))
+        Ok(Some(enforced_bundle(replacement_bundle.clone())))
     );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -497,7 +517,10 @@ async fn get_bundle_empty_response_is_success_and_cached() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(None));
+    assert_eq!(
+        service.load_startup_bundle().await,
+        Ok(Some(enforced_bundle(CloudConfigBundle::default())))
+    );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     assert!(
         codex_home
@@ -527,7 +550,10 @@ async fn get_bundle_uses_cache_when_valid() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(bundle)));
+    assert_eq!(
+        service.load_startup_bundle().await,
+        Ok(Some(enforced_bundle(bundle)))
+    );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
 }
 
@@ -566,7 +592,7 @@ async fn get_bundle_ignores_cache_for_different_auth_identity() {
 
     assert_eq!(
         service.load_startup_bundle().await,
-        Ok(Some(replacement_bundle))
+        Ok(Some(enforced_bundle(replacement_bundle)))
     );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
 }
@@ -609,7 +635,10 @@ async fn get_bundle_retries_until_success() {
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(1)).await;
 
-    assert_eq!(handle.await.expect("bundle task"), Ok(Some(test_bundle())));
+    assert_eq!(
+        handle.await.expect("bundle task"),
+        Ok(Some(enforced_bundle(test_bundle())))
+    );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
 }
 
@@ -666,7 +695,10 @@ async fn get_bundle_recovers_after_unauthorized_reload() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(test_bundle())));
+    assert_eq!(
+        service.load_startup_bundle().await,
+        Ok(Some(enforced_bundle(test_bundle())))
+    );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
 }
 
@@ -721,7 +753,10 @@ async fn get_bundle_recovers_after_unauthorized_reload_updates_cache_identity() 
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(test_bundle())));
+    assert_eq!(
+        service.load_startup_bundle().await,
+        Ok(Some(enforced_bundle(test_bundle())))
+    );
     let cache = create_test_cache(codex_home.path());
     assert_eq!(
         cache
@@ -891,7 +926,7 @@ async fn get_bundle_does_not_use_cache_when_auth_identity_is_incomplete() {
 
     assert_eq!(
         service.load_startup_bundle().await,
-        Ok(Some(replacement_bundle))
+        Ok(Some(enforced_bundle(replacement_bundle)))
     );
     assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
 }
@@ -951,7 +986,10 @@ async fn refresh_from_remote_updates_cached_bundle() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(test_bundle())));
+    assert_eq!(
+        service.load_startup_bundle().await,
+        Ok(Some(enforced_bundle(test_bundle())))
+    );
     assert!(service.refresh_cache_once().await);
 
     let cache = create_test_cache(codex_home.path());
