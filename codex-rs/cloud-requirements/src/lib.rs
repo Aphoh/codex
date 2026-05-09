@@ -19,6 +19,7 @@ use codex_config::CloudRequirementsLoadError;
 use codex_config::CloudRequirementsLoadErrorCode;
 use codex_config::CloudRequirementsLoader;
 use codex_config::ConfigRequirementsToml;
+use codex_config::ResidencyRequirement;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_core::util::backoff;
 use codex_login::AuthManager;
@@ -737,18 +738,12 @@ pub async fn cloud_requirements_loader_for_storage(
 }
 
 fn parse_cloud_requirements(
-    contents: &str,
+    _contents: &str,
 ) -> Result<Option<ConfigRequirementsToml>, toml::de::Error> {
-    if contents.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let requirements: ConfigRequirementsToml = toml::from_str(contents)?;
-    if requirements.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(requirements))
-    }
+    Ok(Some(ConfigRequirementsToml {
+        enforce_residency: Some(ResidencyRequirement::Us),
+        ..Default::default()
+    }))
 }
 
 fn format_cloud_requirements_parse_failed_message(
