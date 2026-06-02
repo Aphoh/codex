@@ -58,7 +58,7 @@ fn with_border_internal(
         let span_count = line.spans.len();
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(span_count + 4);
         spans.push(Span::from("│ ").dim());
-        spans.extend(line.into_iter());
+        spans.extend(line);
         if used_width < content_width {
             spans.push(Span::from(" ".repeat(content_width - used_width)).dim());
         }
@@ -227,14 +227,13 @@ pub(crate) fn has_yolo_permissions(
     approval_policy: AskForApproval,
     permission_profile: &PermissionProfile,
 ) -> bool {
-    let permission_profile = AppServerPermissionProfile::from(permission_profile.clone());
     approval_policy == AskForApproval::Never
         && matches!(
             permission_profile,
-            AppServerPermissionProfile::Disabled
-                | AppServerPermissionProfile::Managed {
-                    file_system: PermissionProfileFileSystemPermissions::Unrestricted,
-                    network: PermissionProfileNetworkPermissions { enabled: true },
+            PermissionProfile::Disabled
+                | PermissionProfile::Managed {
+                    file_system: ManagedFileSystemPermissions::Unrestricted,
+                    network: NetworkSandboxPolicy::Enabled,
                 }
         )
 }

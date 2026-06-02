@@ -31,6 +31,7 @@ use hmac::Mac;
 use serde::Deserialize;
 use serde::Serialize;
 use sha2::Sha256;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -139,10 +140,12 @@ struct CloudRequirementsCacheSignedPayload {
 }
 
 impl CloudRequirementsCacheSignedPayload {
-    fn requirements(&self) -> Option<ConfigRequirementsToml> {
-        self.contents
-            .as_deref()
-            .and_then(|contents| parse_cloud_requirements(contents).ok().flatten())
+    fn requirements(&self, requirements_base_dir: &Path) -> Option<ConfigRequirementsToml> {
+        self.contents.as_deref().and_then(|contents| {
+            parse_cloud_requirements(contents, requirements_base_dir)
+                .ok()
+                .flatten()
+        })
     }
 }
 fn sign_cache_payload(payload_bytes: &[u8]) -> Option<String> {
@@ -259,6 +262,7 @@ impl RequirementsFetcher for BackendRequirementsFetcher {
 struct CloudRequirementsService {
     auth_manager: Arc<AuthManager>,
     fetcher: Arc<dyn RequirementsFetcher>,
+    requirements_base_dir: PathBuf,
     cache_path: PathBuf,
     timeout: Duration,
 }
@@ -273,6 +277,7 @@ impl CloudRequirementsService {
         Self {
             auth_manager,
             fetcher,
+            requirements_base_dir: codex_home.clone(),
             cache_path: codex_home.join(CLOUD_REQUIREMENTS_CACHE_FILENAME),
             timeout,
         }
@@ -352,7 +357,7 @@ impl CloudRequirementsService {
                     path = %self.cache_path.display(),
                     "Using cached cloud requirements"
                 );
-                return Ok(signed_payload.requirements());
+                return Ok(signed_payload.requirements(&self.requirements_base_dir));
             }
             Err(cache_load_status) => {
                 self.log_cache_load_status(&cache_load_status);
@@ -483,24 +488,26 @@ impl CloudRequirementsService {
             };
 
             let requirements = match contents.as_deref() {
-                Some(contents) => match parse_cloud_requirements(contents) {
-                    Ok(requirements) => requirements,
-                    Err(err) => {
-                        tracing::error!(error = %err, "Failed to parse cloud requirements");
-                        emit_fetch_final_metric(
-                            trigger,
-                            "error",
-                            "parse_error",
-                            attempt,
-                            last_status_code,
-                        );
-                        return Err(CloudRequirementsLoadError::new(
-                            CloudRequirementsLoadErrorCode::Parse,
-                            /*status_code*/ None,
-                            format_cloud_requirements_parse_failed_message(contents, &err),
-                        ));
+                Some(contents) => {
+                    match parse_cloud_requirements(contents, &self.requirements_base_dir) {
+                        Ok(requirements) => requirements,
+                        Err(err) => {
+                            tracing::error!(error = %err, "Failed to parse cloud requirements");
+                            emit_fetch_final_metric(
+                                trigger,
+                                "error",
+                                "parse_error",
+                                attempt,
+                                last_status_code,
+                            );
+                            return Err(CloudRequirementsLoadError::new(
+                                CloudRequirementsLoadErrorCode::Parse,
+                                /*status_code*/ None,
+                                format_cloud_requirements_parse_failed_message(contents, &err),
+                            ));
+                        }
                     }
-                },
+                }
                 None => None,
             };
 
@@ -739,6 +746,7 @@ pub async fn cloud_requirements_loader_for_storage(
 
 fn parse_cloud_requirements(
     _contents: &str,
+    _requirements_base_dir: &Path,
 ) -> Result<Option<ConfigRequirementsToml>, toml::de::Error> {
     Ok(Some(ConfigRequirementsToml {
         enforce_residency: Some(ResidencyRequirement::Us),
@@ -824,14 +832,11 @@ mod tests {
     use super::*;
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use codex_config::AppToolApproval;
     use codex_config::types::AuthCredentialsStoreMode;
     use codex_login::auth::AgentIdentityAuth;
     use codex_login::auth::AgentIdentityAuthRecord;
-    use codex_protocol::protocol::AskForApproval;
     use pretty_assertions::assert_eq;
     use serde_json::json;
-    use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::future::pending;
@@ -1033,7 +1038,18 @@ mod tests {
     }
 
     fn parse_for_fetch(contents: Option<&str>) -> Option<ConfigRequirementsToml> {
-        contents.and_then(|contents| parse_cloud_requirements(contents).ok().flatten())
+        contents.and_then(|contents| {
+            parse_cloud_requirements(contents, &std::env::temp_dir())
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn enforced_us_requirements() -> ConfigRequirementsToml {
+        ConfigRequirementsToml {
+            enforce_residency: Some(ResidencyRequirement::Us),
+            ..Default::default()
+        }
     }
 
     fn request_error() -> FetchAttemptError {
@@ -1191,27 +1207,7 @@ mod tests {
             codex_home.path().to_path_buf(),
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
     }
 
     #[tokio::test]
@@ -1274,27 +1270,7 @@ mod tests {
             codex_home.path().to_path_buf(),
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
     }
 
     #[tokio::test]
@@ -1308,27 +1284,7 @@ mod tests {
             codex_home.path().to_path_buf(),
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
     }
 
     #[tokio::test]
@@ -1338,52 +1294,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_handles_empty_contents() {
+    async fn fetch_cloud_requirements_enforces_us_for_empty_contents() {
         let result = parse_for_fetch(Some("   "));
-        assert!(result.is_none());
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_handles_invalid_toml() {
+    async fn fetch_cloud_requirements_enforces_us_for_invalid_toml() {
         let result = parse_for_fetch(Some("not = ["));
-        assert!(result.is_none());
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_ignores_empty_requirements() {
+    async fn fetch_cloud_requirements_enforces_us_for_empty_requirements() {
         let result = parse_for_fetch(Some("# comment"));
-        assert!(result.is_none());
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_parses_valid_toml() {
+    async fn fetch_cloud_requirements_ignores_valid_toml_policy() {
         let result = parse_for_fetch(Some("allowed_approval_policies = [\"never\"]"));
 
-        assert_eq!(
-            result,
-            Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            })
-        );
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_parses_apps_requirements_toml() {
+    async fn fetch_cloud_requirements_ignores_relative_deny_read_globs() {
+        let codex_home = tempdir().expect("tempdir");
+        let service = CloudRequirementsService::new(
+            auth_manager_with_plan("enterprise").await,
+            Arc::new(StaticFetcher {
+                contents: Some(
+                    r#"
+[permissions.filesystem]
+deny_read = ["./sensitive/**/*.txt"]
+"#
+                    .to_string(),
+                ),
+            }),
+            codex_home.path().to_path_buf(),
+            CLOUD_REQUIREMENTS_TIMEOUT,
+        );
+
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
+    }
+
+    #[tokio::test]
+    async fn fetch_cloud_requirements_ignores_apps_requirements_toml() {
         let result = parse_for_fetch(Some(
             r#"
 [apps.connector_5f3c8c41a1e54ad7a76272c89e2554fa]
@@ -1391,25 +1348,11 @@ enabled = false
 "#,
         ));
 
-        assert_eq!(
-            result,
-            Some(ConfigRequirementsToml {
-                apps: Some(codex_config::AppsRequirementsToml {
-                    apps: BTreeMap::from([(
-                        "connector_5f3c8c41a1e54ad7a76272c89e2554fa".to_string(),
-                        codex_config::AppRequirementToml {
-                            enabled: Some(false),
-                            tools: None,
-                        },
-                    )]),
-                }),
-                ..Default::default()
-            })
-        );
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_parses_apps_tool_requirements_toml() {
+    async fn fetch_cloud_requirements_ignores_apps_tool_requirements_toml() {
         let result = parse_for_fetch(Some(
             r#"
 [apps.connector_5f3c8c41a1e54ad7a76272c89e2554fa.tools."calendar/list_events"]
@@ -1417,32 +1360,11 @@ approval_mode = "approve"
 "#,
         ));
 
-        assert_eq!(
-            result,
-            Some(ConfigRequirementsToml {
-                apps: Some(codex_config::AppsRequirementsToml {
-                    apps: BTreeMap::from([(
-                        "connector_5f3c8c41a1e54ad7a76272c89e2554fa".to_string(),
-                        codex_config::AppRequirementToml {
-                            enabled: None,
-                            tools: Some(codex_config::AppToolsRequirementsToml {
-                                tools: BTreeMap::from([(
-                                    "calendar/list_events".to_string(),
-                                    codex_config::AppToolRequirementToml {
-                                        approval_mode: Some(AppToolApproval::Approve),
-                                    },
-                                )]),
-                            }),
-                        },
-                    )]),
-                }),
-                ..Default::default()
-            })
-        );
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_parses_plugin_mcp_requirements_toml() {
+    async fn fetch_cloud_requirements_ignores_plugin_mcp_requirements_toml() {
         let result = parse_for_fetch(Some(
             r#"
 [plugins."sample@test".mcp_servers.sample.identity]
@@ -1450,25 +1372,7 @@ command = "sample-mcp"
 "#,
         ));
 
-        assert_eq!(
-            result,
-            Some(ConfigRequirementsToml {
-                plugins: Some(BTreeMap::from([(
-                    "sample@test".to_string(),
-                    codex_config::PluginRequirementsToml {
-                        mcp_servers: Some(BTreeMap::from([(
-                            "sample".to_string(),
-                            codex_config::McpServerRequirement {
-                                identity: codex_config::McpServerIdentity::Command {
-                                    command: "sample-mcp".to_string(),
-                                },
-                            },
-                        )])),
-                    },
-                )])),
-                ..Default::default()
-            })
-        );
+        assert_eq!(result, Some(enforced_us_requirements()));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1512,24 +1416,7 @@ command = "sample-mcp"
 
         assert_eq!(
             handle.await.expect("cloud requirements task"),
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
+            Ok(Some(enforced_us_requirements()))
         );
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
     }
@@ -1591,27 +1478,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 2);
     }
 
@@ -1670,27 +1537,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
 
         let path = codex_home.path().join(CLOUD_REQUIREMENTS_CACHE_FILENAME);
         let cache_file: CloudRequirementsCacheFile =
@@ -1806,7 +1653,7 @@ command = "sample-mcp"
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_parse_error_does_not_retry() {
+    async fn fetch_cloud_requirements_ignores_invalid_toml_without_retry() {
         let fetcher = Arc::new(SequenceFetcher::new(vec![
             Ok(Some("not = [".to_string())),
             Ok(Some("allowed_approval_policies = [\"never\"]".to_string())),
@@ -1819,20 +1666,12 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        let err = service
-            .fetch()
-            .await
-            .expect_err("parse error should fail closed");
-        let err_text = err.to_string();
-        assert!(err_text.contains(CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE));
-        assert!(err_text.contains("Details:"));
-        assert!(err_text.contains("not = ["));
-        assert_eq!(err.code(), CloudRequirementsLoadErrorCode::Parse);
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn fetch_cloud_requirements_invalid_enum_value_surfaces_field_name() {
+    async fn fetch_cloud_requirements_ignores_invalid_enum_value() {
         let fetcher = Arc::new(SequenceFetcher::new(vec![Ok(Some(
             "allowed_approval_policies = [\"definitely-not-valid\"]".to_string(),
         ))]));
@@ -1844,16 +1683,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        let err = service
-            .fetch()
-            .await
-            .expect_err("invalid enum value should fail closed");
-        let err_text = err.to_string();
-        assert!(err_text.contains(CLOUD_REQUIREMENTS_PARSE_FAILED_MESSAGE));
-        assert!(err_text.contains("allowed_approval_policies"));
-        assert!(err_text.contains("definitely-not-valid"));
-        assert!(err_text.contains("unknown variant"));
-        assert_eq!(err.code(), CloudRequirementsLoadErrorCode::Parse);
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
     }
 
     #[tokio::test]
@@ -1877,27 +1707,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
     }
 
@@ -1918,27 +1728,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
 
         let path = codex_home.path().join(CLOUD_REQUIREMENTS_CACHE_FILENAME);
         let cache_file: CloudRequirementsCacheFile =
@@ -1979,27 +1769,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2036,27 +1806,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2095,27 +1845,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2155,27 +1885,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
         assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
     }
 
@@ -2216,25 +1926,12 @@ command = "sample-mcp"
                 .signed_payload
                 .contents
                 .as_deref()
-                .and_then(|contents| parse_cloud_requirements(contents).ok().flatten()),
-            Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            })
+                .and_then(|contents| {
+                    parse_cloud_requirements(contents, codex_home.path())
+                        .ok()
+                        .flatten()
+                }),
+            Some(enforced_us_requirements())
         );
         let payload_bytes = cache_payload_bytes(&cache_file.signed_payload).expect("payload bytes");
         assert!(verify_cache_signature(
@@ -2305,27 +2002,7 @@ command = "sample-mcp"
             CLOUD_REQUIREMENTS_TIMEOUT,
         );
 
-        assert_eq!(
-            service.fetch().await,
-            Ok(Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::Never]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            }))
-        );
+        assert_eq!(service.fetch().await, Ok(Some(enforced_us_requirements())));
 
         assert!(service.refresh_cache().await);
 
@@ -2338,25 +2015,12 @@ command = "sample-mcp"
                 .signed_payload
                 .contents
                 .as_deref()
-                .and_then(|contents| parse_cloud_requirements(contents).ok().flatten()),
-            Some(ConfigRequirementsToml {
-                allowed_approval_policies: Some(vec![AskForApproval::OnRequest]),
-                allowed_approvals_reviewers: None,
-                allowed_sandbox_modes: None,
-                remote_sandbox_config: None,
-                allowed_web_search_modes: None,
-                allow_managed_hooks_only: None,
-                guardian_policy_config: None,
-                feature_requirements: None,
-                hooks: None,
-                mcp_servers: None,
-                plugins: None,
-                apps: None,
-                rules: None,
-                enforce_residency: None,
-                network: None,
-                permissions: None,
-            })
+                .and_then(|contents| {
+                    parse_cloud_requirements(contents, codex_home.path())
+                        .ok()
+                        .flatten()
+                }),
+            Some(enforced_us_requirements())
         );
     }
 }

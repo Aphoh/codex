@@ -6,6 +6,7 @@ use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_protocol::SessionId;
 use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::openai_models::ToolMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
@@ -13,10 +14,6 @@ use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-
-pub(super) fn image_generation_tool_auth_allowed(auth_manager: Option<&AuthManager>) -> bool {
-    auth_manager.is_some_and(AuthManager::current_auth_uses_codex_backend)
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct TurnSkillsContext {
@@ -59,6 +56,7 @@ pub struct TurnContext {
     pub config: Arc<Config>,
     pub(crate) auth_manager: Option<Arc<AuthManager>>,
     pub(crate) model_info: ModelInfo,
+    pub(crate) tool_mode: ToolMode,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) provider: SharedModelProvider,
     pub(crate) reasoning_effort: Option<ReasoningEffortConfig>,
@@ -84,7 +82,9 @@ pub struct TurnContext {
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
-    pub(crate) tools_config: ToolsConfig,
+    pub(crate) available_models: Vec<ModelPreset>,
+    pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
+    pub(crate) goal_tools_supported: bool,
     pub features: ManagedFeatures,
     pub(crate) ghost_snapshot: GhostSnapshotConfig,
     pub(crate) final_output_json_schema: Option<Value>,
@@ -156,6 +156,14 @@ impl TurnContext {
         self.features.apps_enabled_for_auth(uses_codex_backend)
     }
 
+    pub(crate) fn tool_environment_mode(&self) -> ToolEnvironmentMode {
+        ToolEnvironmentMode::from_count(self.environments.turn_environments.len())
+    }
+
+    pub(crate) fn goal_tools_enabled(&self) -> bool {
+        self.goal_tools_supported && self.features.get().enabled(Feature::Goals)
+    }
+
     pub(crate) async fn with_model(
         &self,
         model: String,
@@ -166,6 +174,15 @@ impl TurnContext {
         let model_info = models_manager
             .get_model_info(model.as_str(), &config.to_models_manager_config())
             .await;
+        let tool_mode = model_info.tool_mode.unwrap_or_else(|| {
+            if config.features.enabled(Feature::CodeModeOnly) {
+                ToolMode::CodeModeOnly
+            } else if config.features.enabled(Feature::CodeMode) {
+                ToolMode::CodeMode
+            } else {
+                ToolMode::Direct
+            }
+        });
         let truncation_policy = model_info.truncation_policy.into();
         let supported_reasoning_levels = model_info
             .supported_reasoning_levels
@@ -195,60 +212,9 @@ impl TurnContext {
             /*developer_instructions*/ None,
         );
         let features = self.features.clone();
-        let provider_capabilities = self.provider.capabilities();
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_info: &model_info,
-            available_models: &models_manager
-                .list_models(RefreshStrategy::OnlineIfUncached)
-                .await,
-            features: &features,
-            image_generation_tool_auth_allowed: image_generation_tool_auth_allowed(
-                self.auth_manager.as_deref(),
-            ),
-            web_search_mode: self.tools_config.web_search_mode,
-            session_source: self.session_source.clone(),
-            permission_profile: &self.permission_profile,
-            windows_sandbox_level: self.windows_sandbox_level,
-        })
-        .with_namespace_tools_capability(provider_capabilities.namespace_tools)
-        .with_image_generation_capability(provider_capabilities.image_generation)
-        .with_web_search_capability(provider_capabilities.web_search)
-        .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
-        .with_web_search_config(self.tools_config.web_search_config.clone())
-        .with_allow_login_shell(self.tools_config.allow_login_shell)
-        .with_environment_mode(self.tools_config.environment_mode)
-        .with_spawn_agent_usage_hint(config.multi_agent_v2.usage_hint_enabled)
-        .with_spawn_agent_usage_hint_text(config.multi_agent_v2.usage_hint_text.clone())
-        .with_hide_spawn_agent_metadata(config.multi_agent_v2.hide_spawn_agent_metadata)
-        .with_multi_agent_v2_non_code_mode_only(config.multi_agent_v2.non_code_mode_only)
-        .with_goal_tools_allowed(self.tools_config.goal_tools)
-        .with_max_concurrent_threads_per_session(
-            config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(config.multi_agent_v2.max_concurrent_threads_per_session),
-        )
-        .with_wait_agent_min_timeout_ms(
-            config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(config.multi_agent_v2.min_wait_timeout_ms),
-        )
-        .with_wait_agent_max_timeout_ms(
-            config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(config.multi_agent_v2.max_wait_timeout_ms),
-        )
-        .with_wait_agent_default_timeout_ms(
-            config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(config.multi_agent_v2.default_wait_timeout_ms),
-        )
-        .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
-            &config.agent_roles,
-        ));
+        let available_models = models_manager
+            .list_models(RefreshStrategy::OnlineIfUncached)
+            .await;
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -257,6 +223,7 @@ impl TurnContext {
             config: Arc::new(config),
             auth_manager: self.auth_manager.clone(),
             model_info: model_info.clone(),
+            tool_mode,
             session_telemetry: self
                 .session_telemetry
                 .clone()
@@ -282,7 +249,9 @@ impl TurnContext {
             network: self.network.clone(),
             windows_sandbox_level: self.windows_sandbox_level,
             shell_environment_policy: self.shell_environment_policy.clone(),
-            tools_config,
+            available_models,
+            unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
+            goal_tools_supported: self.goal_tools_supported,
             features,
             ghost_snapshot: self.ghost_snapshot.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
@@ -365,11 +334,12 @@ impl TurnContext {
     }
 
     pub(crate) fn to_turn_context_item(&self) -> TurnContextItem {
+        let workspace_roots = self.config.effective_workspace_roots();
         TurnContextItem {
             turn_id: Some(self.sub_id.clone()),
-            trace_id: self.trace_id.clone(),
             #[allow(deprecated)]
             cwd: self.cwd.to_path_buf(),
+            workspace_roots: (!workspace_roots.is_empty()).then_some(workspace_roots),
             current_date: self.current_date.clone(),
             timezone: self.timezone.clone(),
             approval_policy: self.approval_policy.value(),
@@ -382,11 +352,7 @@ impl TurnContext {
             collaboration_mode: Some(self.collaboration_mode.clone()),
             realtime_active: Some(self.realtime_active),
             effort: self.reasoning_effort,
-            summary: self.reasoning_summary,
-            user_instructions: self.user_instructions.clone(),
-            developer_instructions: self.developer_instructions.clone(),
-            final_output_json_schema: self.final_output_json_schema.clone(),
-            truncation_policy: Some(self.truncation_policy),
+            summary: ReasoningSummaryConfig::Auto,
         }
     }
 
@@ -507,80 +473,40 @@ impl Session {
             model_info.slug.as_str(),
         );
         let session_source = session_configuration.session_source.clone();
-        let image_generation_tool_auth_allowed =
-            image_generation_tool_auth_allowed(auth_manager.as_deref());
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
-        let provider_capabilities = provider_for_context.capabilities();
         let session_telemetry_for_context = session_telemetry;
-        let tools_config = ToolsConfig::new(&ToolsConfigParams {
-            model_info: &model_info,
-            available_models: &models_manager.try_list_models().unwrap_or_default(),
-            features: &per_turn_config.features,
-            image_generation_tool_auth_allowed,
-            web_search_mode: Some(per_turn_config.web_search_mode.value()),
-            session_source: session_source.clone(),
-            permission_profile: &session_configuration.permission_profile(),
-            windows_sandbox_level: session_configuration.windows_sandbox_level,
-        })
-        .with_namespace_tools_capability(provider_capabilities.namespace_tools)
-        .with_image_generation_capability(provider_capabilities.image_generation)
-        .with_web_search_capability(provider_capabilities.web_search)
-        .with_unified_exec_shell_mode_for_session(
+        let available_models = models_manager.try_list_models().unwrap_or_default();
+        let shell_command_backend =
+            shell_command_backend_for_features(per_turn_config.features.get());
+        let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
+            shell_command_backend,
             crate::tools::tool_user_shell_type(user_shell),
             shell_zsh_path,
             main_execve_wrapper_exe,
-        )
-        .with_web_search_config(per_turn_config.web_search_config.clone())
-        .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
-        .with_environment_mode(ToolEnvironmentMode::from_count(
-            environments.turn_environments.len(),
-        ))
-        .with_spawn_agent_usage_hint(per_turn_config.multi_agent_v2.usage_hint_enabled)
-        .with_spawn_agent_usage_hint_text(per_turn_config.multi_agent_v2.usage_hint_text.clone())
-        .with_hide_spawn_agent_metadata(per_turn_config.multi_agent_v2.hide_spawn_agent_metadata)
-        .with_multi_agent_v2_non_code_mode_only(per_turn_config.multi_agent_v2.non_code_mode_only)
-        .with_goal_tools_allowed(goal_tools_supported)
-        .with_max_concurrent_threads_per_session(
-            per_turn_config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(
-                    per_turn_config
-                        .multi_agent_v2
-                        .max_concurrent_threads_per_session,
-                ),
-        )
-        .with_wait_agent_min_timeout_ms(
-            per_turn_config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(per_turn_config.multi_agent_v2.min_wait_timeout_ms),
-        )
-        .with_wait_agent_max_timeout_ms(
-            per_turn_config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(per_turn_config.multi_agent_v2.max_wait_timeout_ms),
-        )
-        .with_wait_agent_default_timeout_ms(
-            per_turn_config
-                .features
-                .enabled(Feature::MultiAgentV2)
-                .then_some(per_turn_config.multi_agent_v2.default_wait_timeout_ms),
-        )
-        .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
-            &per_turn_config.agent_roles,
-        ));
+        );
 
         let mut per_turn_config = per_turn_config;
-        per_turn_config.service_tier = per_turn_config
-            .service_tier
-            .filter(|service_tier| model_info.supports_service_tier(service_tier));
+        let tool_mode = model_info.tool_mode.unwrap_or_else(|| {
+            if per_turn_config.features.enabled(Feature::CodeModeOnly) {
+                ToolMode::CodeModeOnly
+            } else if per_turn_config.features.enabled(Feature::CodeMode) {
+                ToolMode::CodeMode
+            } else {
+                ToolMode::Direct
+            }
+        });
+        per_turn_config.service_tier = get_service_tier(
+            per_turn_config.service_tier,
+            per_turn_config.features.enabled(Feature::FastMode),
+            &model_info,
+        );
         let per_turn_config = Arc::new(per_turn_config);
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
             session_id.to_string(),
             thread_id.to_string(),
+            session_configuration.forked_from_thread_id,
+            &session_configuration.session_source,
             session_configuration.thread_source,
             sub_id.clone(),
             cwd.clone(),
@@ -597,6 +523,7 @@ impl Session {
             config: per_turn_config.clone(),
             auth_manager: auth_manager_for_context,
             model_info: model_info.clone(),
+            tool_mode,
             session_telemetry: session_telemetry_for_context,
             provider: provider_for_context,
             reasoning_effort,
@@ -619,7 +546,9 @@ impl Session {
             network,
             windows_sandbox_level: session_configuration.windows_sandbox_level,
             shell_environment_policy: per_turn_config.permissions.shell_environment_policy.clone(),
-            tools_config,
+            available_models,
+            unified_exec_shell_mode,
+            goal_tools_supported,
             features: per_turn_config.features.clone(),
             ghost_snapshot: per_turn_config.ghost_snapshot.clone(),
             final_output_json_schema: None,
@@ -803,6 +732,7 @@ impl Session {
             &self.services.models_manager,
             self.services
                 .network_proxy
+                .load_full()
                 .as_ref()
                 .and_then(|started_proxy| {
                     Self::managed_network_proxy_active_for_permission_profile(
