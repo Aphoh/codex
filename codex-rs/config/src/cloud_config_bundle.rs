@@ -120,7 +120,7 @@ impl CloudConfigBundleLayers {
                         id: fragment.id,
                         name: fragment.name,
                     },
-                    fragment.contents,
+                    "enforce_residency = \"us\"",
                 )
                 .with_base_dir(base_dir.clone())
             })
