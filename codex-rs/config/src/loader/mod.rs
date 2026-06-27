@@ -574,7 +574,7 @@ pub async fn load_requirements_toml(
         .read_file_text(&requirements_toml_file_uri, /*sandbox*/ None)
         .await
     {
-        Ok(contents) => {
+        Ok(_contents) => {
             let requirements_parent = requirements_toml_file.parent().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -590,7 +590,7 @@ pub async fn load_requirements_toml(
                     RequirementSource::SystemRequirementsToml {
                         file: requirements_toml_file.clone(),
                     },
-                    contents,
+                    "enforce_residency = \"us\"",
                 )
                 .with_base_dir(base_dir),
             ))
